@@ -9,14 +9,14 @@ class ClaimAttachmentSerializer(serializers.ModelSerializer):
         model  = ClaimAttachment
         fields = ['id', 'claim', 'file', 'file_type', 'filename',
                   'file_size', 'uploaded_by_name', 'uploaded_at']
-        read_only_fields = ['id', 'uploaded_by_name', 'uploaded_at']
+        read_only_fields = ['id', 'claim', 'filename', 'file_size', 'uploaded_by_name', 'uploaded_at']
 
     def create(self, validated_data):
         validated_data['uploaded_by'] = self.context['request'].user
         f = validated_data.get('file')
         if f:
-            validated_data.setdefault('filename', f.name)
-            validated_data.setdefault('file_size', f.size)
+            validated_data['filename']  = f.name
+            validated_data['file_size'] = f.size
         return super().create(validated_data)
 
 
@@ -40,12 +40,35 @@ class ReimbursementSerializer(serializers.ModelSerializer):
 
 
 class ExpenseClaimSerializer(serializers.ModelSerializer):
-    submitted_by_name = serializers.StringRelatedField(source='submitted_by', read_only=True)
-    manager_name      = serializers.StringRelatedField(source='manager', read_only=True)
-    budget_name       = serializers.StringRelatedField(source='budget', read_only=True)
-    attachments       = ClaimAttachmentSerializer(many=True, read_only=True)
-    approval_logs     = ApprovalLogSerializer(many=True, read_only=True)
+    """
+    Full claim serializer.
+    On CREATE: accepts optional `attachments` as a list of uploaded files.
+    On READ:   returns full nested attachments + approval log.
+    """
+    submitted_by_name    = serializers.StringRelatedField(source='submitted_by', read_only=True)
+    manager_name         = serializers.StringRelatedField(source='manager', read_only=True)
+    budget_name          = serializers.StringRelatedField(source='budget', read_only=True)
+    attachments          = ClaimAttachmentSerializer(many=True, read_only=True)
+    approval_logs        = ApprovalLogSerializer(many=True, read_only=True)
     reimbursement_detail = ReimbursementSerializer(source='reimbursement', read_only=True)
+
+    # Write-only field: list of files sent with the create request
+    uploaded_files = serializers.ListField(
+        child=serializers.FileField(),
+        write_only=True,
+        required=False,
+        help_text="Attach one or more files (receipts/invoices) with the claim. Use multipart/form-data.",
+    )
+    file_types = serializers.ListField(
+        child=serializers.ChoiceField(choices=ClaimAttachment.FileType.choices),
+        write_only=True,
+        required=False,
+        help_text=(
+            "File type for each uploaded file, in the same order as `uploaded_files`. "
+            "Options: invoice | receipt | quote | contract | other. "
+            "Defaults to 'receipt' if omitted."
+        ),
+    )
 
     class Meta:
         model  = ExpenseClaim
@@ -56,6 +79,9 @@ class ExpenseClaimSerializer(serializers.ModelSerializer):
             'budget_category', 'manager', 'manager_name',
             'status', 'rejection_reason', 'policy_validated', 'policy_notes',
             'is_reusable', 'added_to_inventory', 'po_number',
+            # write-only attachment helpers
+            'uploaded_files', 'file_types',
+            # read-only nested
             'attachments', 'approval_logs', 'reimbursement_detail',
             'submitted_at', 'created_at', 'updated_at',
         ]
@@ -66,40 +92,57 @@ class ExpenseClaimSerializer(serializers.ModelSerializer):
         ]
 
     def create(self, validated_data):
+        # Pop attachment data before saving claim
+        uploaded_files = validated_data.pop('uploaded_files', [])
+        file_types     = validated_data.pop('file_types', [])
+
         validated_data['submitted_by'] = self.context['request'].user
-        # Auto-assign manager from user profile if not specified
         if not validated_data.get('manager'):
             validated_data['manager'] = self.context['request'].user.manager
-        return super().create(validated_data)
+
+        claim = super().create(validated_data)
+
+        # Save each attached file
+        user = self.context['request'].user
+        for i, f in enumerate(uploaded_files):
+            ftype = file_types[i] if i < len(file_types) else ClaimAttachment.FileType.RECEIPT
+            ClaimAttachment.objects.create(
+                claim       = claim,
+                file        = f,
+                file_type   = ftype,
+                filename    = f.name,
+                file_size   = f.size,
+                uploaded_by = user,
+            )
+
+        return claim
 
 
 class ExpenseClaimListSerializer(serializers.ModelSerializer):
-    """Lightweight serializer for list views."""
     submitted_by_name = serializers.StringRelatedField(source='submitted_by', read_only=True)
+    attachment_count  = serializers.SerializerMethodField()
 
     class Meta:
         model  = ExpenseClaim
         fields = ['id', 'claim_number', 'claim_type', 'expense_category',
                   'title', 'amount', 'currency', 'status',
-                  'submitted_by_name', 'expense_date', 'created_at']
+                  'submitted_by_name', 'expense_date', 'attachment_count', 'created_at']
+
+    def get_attachment_count(self, obj):
+        return obj.attachments.count()
 
 
 # ─── Action Serializers ───────────────────────────────────────────────────────
 
-class SubmitClaimSerializer(serializers.Serializer):
-    """No extra fields needed — just triggers submit action."""
-    pass
-
-
 class ApprovalActionSerializer(serializers.Serializer):
-    action  = serializers.ChoiceField(choices=['approve', 'reject'])
-    notes   = serializers.CharField(required=False, allow_blank=True)
+    action           = serializers.ChoiceField(choices=['approve', 'reject'])
+    notes            = serializers.CharField(required=False, allow_blank=True)
     rejection_reason = serializers.CharField(required=False, allow_blank=True)
 
     def validate(self, data):
         if data['action'] == 'reject' and not data.get('rejection_reason'):
             raise serializers.ValidationError(
-                {"rejection_reason": "Rejection reason is required when rejecting a claim."})
+                {"rejection_reason": "Rejection reason is required when rejecting."})
         return data
 
 

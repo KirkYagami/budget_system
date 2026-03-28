@@ -3,6 +3,9 @@ from rest_framework import serializers
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from .models import User
 
+# Roles that only an admin can assign
+ELEVATED_ROLES = {'finance', 'budget_owner', 'admin'}
+
 
 class RegisterSerializer(serializers.ModelSerializer):
     password  = serializers.CharField(write_only=True, validators=[validate_password])
@@ -16,6 +19,18 @@ class RegisterSerializer(serializers.ModelSerializer):
     def validate(self, data):
         if data['password'] != data.pop('password2'):
             raise serializers.ValidationError({"password": "Passwords do not match."})
+
+        # Security: only admins can self-assign elevated roles
+        requested_role = data.get('role', User.Role.EMPLOYEE)
+        request = self.context.get('request')
+        is_admin = request and request.user.is_authenticated and request.user.role in ('admin',)
+        is_superuser = request and request.user.is_authenticated and request.user.is_superuser
+
+        if requested_role in ELEVATED_ROLES and not (is_admin or is_superuser):
+            raise serializers.ValidationError({
+                "role": f"You cannot self-assign the '{requested_role}' role. Contact an admin."
+            })
+
         return data
 
     def create(self, validated_data):
@@ -35,12 +50,18 @@ class UserSerializer(serializers.ModelSerializer):
         return str(obj.manager) if obj.manager else None
 
 
-class CustomTokenSerializer(TokenObtainPairSerializer):
-    """JWT token that includes user info in the response."""
+class AdminUserUpdateSerializer(serializers.ModelSerializer):
+    """Admin-only serializer — can update role and all fields."""
+    class Meta:
+        model  = User
+        fields = ['email', 'first_name', 'last_name', 'role',
+                  'department', 'manager', 'phone', 'is_active']
 
+
+class CustomTokenSerializer(TokenObtainPairSerializer):
     def validate(self, attrs):
-        data  = super().validate(attrs)
-        user  = self.user
+        data = super().validate(attrs)
+        user = self.user
         data['user'] = {
             'id':         user.id,
             'username':   user.username,
